@@ -47,7 +47,7 @@ export const PROVIDERS: ProviderSpec[] = [
     needsApiKey: false,
     defaultModel: 'llama3.1:8b',
     defaultVisionModel: 'llava',
-    models: ['llama3.1:8b', 'llama3.2', 'qwen2.5:7b', 'mistral', 'phi3', 'llava', 'gemma2'],
+    models: ['llama3.1:8b', 'llama3.2', 'qwen2.5:7b', 'mistral', 'phi3', 'llava', 'gemma2', 'minimax-m3:cloud'],
     baseUrl: 'http://localhost:11434',
     hint: 'Runs entirely on this machine. Install from ollama.com, then `ollama pull llama3.1:8b`.',
   },
@@ -163,6 +163,30 @@ export const PROVIDERS: ProviderSpec[] = [
     // Bytez's OpenAI-compatible surface lives under this path, not at /v1.
     baseUrl: 'https://api.bytez.com/models/v2/openai/v1',
     hint: 'Serverless HuggingFace models, OpenAI-compatible. Key from bytez.com. Enter a model id exactly as it appears in the Bytez catalog — an id they do not host is rejected with a 404.',
+  },
+  {
+    id: 'cloudflare',
+    label: 'Cloudflare Workers AI',
+    needsApiKey: true,
+    // The free tier is the only tier: 10,000 neurons/day on every model below,
+    // and a model with no free neurons is omitted from the picker. The 8B
+    // Llama is the highest-quality default that still fits in that budget.
+    defaultModel: '@cf/meta/llama-3.1-8b-instruct',
+    defaultVisionModel: '@cf/meta/llama-3.1-8b-instruct',
+    models: [
+      '@cf/meta/llama-3.1-8b-instruct',
+      '@cf/meta/llama-3.2-3b-instruct',
+      '@cf/mistral/mistral-7b-instruct-v0.1',
+      '@cf/qwen/qwen1.5-7b-chat-awq',
+      '@cf/google/gemma-7b-it',
+    ],
+    // The base URL is per-account because every Cloudflare account has its own
+    // account id. The transport receives it as `baseUrl` from the settings
+    // store, which fills in the active account id and appends `/ai/run/` —
+    // this entry only exists so the picker has a default for the UI before
+    // the user has entered an account id.
+    baseUrl: 'https://api.cloudflare.com/client/v4/accounts/__account_id__/ai/run/',
+    hint: 'Free tier: 10,000 neurons/day. Account id from dash.cloudflare.com, token from My Profile → API Tokens (Workers AI template).',
   },
   {
     id: 'custom',
@@ -1011,6 +1035,131 @@ async function* streamGemini(
   yield { done: true };
 }
 
+/* ── Cloudflare Workers AI ───────────────────────────────────────── */
+
+/**
+ * Cloudflare's chat-completions surface speaks the OpenAI SSE dialect
+ * verbatim — same `choices[].delta.content` shape, same `finish_reason`,
+ * same tool-call streaming — so the parser is identical. The only
+ * differences are the URL pattern (per-account, model id in the path) and
+ * the auth header (Bearer, no `Authorization` quirks). One transport, one
+ * parse loop, a different label on errors.
+ */
+async function* streamCloudflare(
+  config: LLMConfig,
+  messages: Message[],
+  tools: ToolSchema[],
+  signal?: AbortSignal,
+): AsyncGenerator<LLMChunk> {
+  // The provider spec's `baseUrl` is a placeholder until the user has
+  // entered an account id — see the entry above. The settings store fills
+  // in the real one before a request is sent; if it ever arrives blank,
+  // surface that rather than hitting Cloudflare's `/accounts//ai/run/`
+  // path which 404s without explaining the cause.
+  const rawBase = resolveBaseUrl(config);
+  const accountId = (config.apiKeyExtra?.cloudflareAccountId ?? '').trim();
+  const token = (config.apiKey ?? '').trim();
+  if (!accountId) {
+    yield {
+      error: 'Cloudflare AI needs an Account ID. Add it in Settings → Keys.',
+      done: true,
+    };
+    return;
+  }
+  const base =
+    rawBase.includes('__account_id__') || rawBase.endsWith('/ai/run/')
+      ? `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run`
+      : rawBase.replace(/\/+$/, '');
+  const url = `${base}/${encodeURIComponent(config.model)}`;
+
+  const converted = toOpenAIMessages(messages);
+  const wireTools = tools.length > 0 ? toOpenAITools(tools) : undefined;
+
+  const body: Record<string, unknown> = {
+    messages: converted,
+    stream: true,
+    max_tokens: config.maxTokens,
+  };
+  if (typeof config.temperature === 'number') body.temperature = config.temperature;
+  if (wireTools) {
+    body.tools = wireTools;
+    body.tool_choice = 'auto';
+  }
+
+  const res = await openStreamWithRetry(
+    {
+      provider: 'cloudflare',
+      model: config.model,
+      messages: converted,
+      apiKey: token,
+      baseUrl: url,
+      tools: wireTools,
+      temperature: config.temperature,
+      maxTokens: config.maxTokens,
+      signal,
+      label: 'cloudflare',
+    },
+    { url, body, headers: token ? { Authorization: `Bearer ${token}` } : {} },
+  );
+  if (!res.ok) {
+    yield { error: await describeHttpError(res, 'cloudflare'), done: true };
+    return;
+  }
+
+  // Tool calls stream in fragments keyed by index; assemble them as we go.
+  const pending = new Map<number, { id: string; name: string; args: string }>();
+
+  for await (const payload of readSSE(res)) {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+
+    const choice = (parsed.choices as Array<Record<string, unknown>> | undefined)?.[0];
+    if (!choice) continue;
+
+    const delta = choice.delta as Record<string, unknown> | undefined;
+    if (!delta) continue;
+
+    if (typeof delta.content === 'string' && delta.content) {
+      yield { delta: delta.content };
+    }
+
+    const toolCalls = delta.tool_calls as Array<Record<string, unknown>> | undefined;
+    if (toolCalls) {
+      for (const tc of toolCalls) {
+        const index = typeof tc.index === 'number' ? tc.index : 0;
+        const fn = tc.function as Record<string, unknown> | undefined;
+
+        const entry = pending.get(index) ?? { id: '', name: '', args: '' };
+        if (typeof tc.id === 'string' && tc.id) entry.id = tc.id;
+        if (typeof fn?.name === 'string' && fn.name) entry.name = fn.name;
+        if (typeof fn?.arguments === 'string') entry.args += fn.arguments;
+        pending.set(index, entry);
+      }
+    }
+
+    // `finish_reason` marks the point at which every fragment has arrived.
+    if (choice.finish_reason) {
+      for (const entry of pending.values()) {
+        const call = finaliseToolCall(entry.id, entry.name, entry.args);
+        if (call) yield { toolCall: call };
+      }
+      pending.clear();
+    }
+  }
+
+  // Some gateways close the stream without ever sending finish_reason.
+  for (const entry of pending.values()) {
+    const call = finaliseToolCall(entry.id, entry.name, entry.args);
+    if (call) yield { toolCall: call };
+  }
+
+  yield { done: true };
+}
+
 /* ── Errors ──────────────────────────────────────────────────────── */
 
 /** Turn an HTTP failure into something the user can act on. */
@@ -1083,6 +1232,9 @@ export async function* streamChat(
         break;
       case 'gemini':
         yield* streamGemini(config, messages, tools, signal);
+        break;
+      case 'cloudflare':
+        yield* streamCloudflare(config, messages, tools, signal);
         break;
       default:
         yield* streamOpenAICompatible(config, messages, tools, signal);

@@ -25,7 +25,8 @@ export type TransportProvider =
   | 'groq'
   | 'openai'
   | 'anthropic'
-  | 'gemini';
+  | 'gemini'
+  | 'cloudflare';
 
 export interface ProviderStreamParams {
   provider: TransportProvider;
@@ -84,6 +85,7 @@ const COMMANDS: Record<Exclude<TransportProvider, 'builtin'>, string> = {
   openai: 'openai_chat',
   anthropic: 'anthropic_chat',
   gemini: 'gemini_chat',
+  cloudflare: 'cloudflare_chat',
 };
 
 /**

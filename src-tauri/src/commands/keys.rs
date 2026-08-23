@@ -19,8 +19,16 @@ use crate::util::{NovaError, JResult};
 
 /// Providers the config always carries, so the settings UI has a stable set of
 /// tabs whether or not a key has ever been saved for one.
-pub const PROVIDERS: [&str; 7] =
-    ["openai", "anthropic", "gemini", "groq", "openrouter", "nvidia", "bytez"];
+pub const PROVIDERS: [&str; 8] = [
+    "openai",
+    "anthropic",
+    "gemini",
+    "groq",
+    "openrouter",
+    "nvidia",
+    "bytez",
+    "cloudflare",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyConfig {
@@ -80,6 +88,11 @@ pub fn default_model_for(provider: &str) -> String {
         // without function calling, which rules out most of their catalogue.
         "nvidia" => "meta/llama-3.3-70b-instruct",
         "bytez" => "google/gemma-2-9b-it",
+        // Cloudflare's free tier — 10,000 neurons/day, well above what the 8B
+        // model consumes. Resolving from the live catalogue would be nicer but
+        // Cloudflare does not require a key to list models, so the dropdown is
+        // populated by the settings page rather than by `load()`.
+        "cloudflare" => "@cf/meta/llama-3.1-8b-instruct",
         _ => "google/gemma-4-26b-a4b-it:free",
     }
     .into()
@@ -676,6 +689,28 @@ fn probe(provider: &str, key: &str) -> Option<reqwest::RequestBuilder> {
         "bytez" => client
             .get("https://api.bytez.com/models/v2/list/tasks")
             .header(reqwest::header::AUTHORIZATION, key),
+        // Cloudflare needs an account id in the URL; the token alone cannot
+        // reach a model. The settings page tests both at once, so this path
+        // is only hit when the account id has already been stored.
+        "cloudflare" => {
+            let Some(account_id) = current()
+                .keys
+                .get("cloudflare_account_id")
+                .filter(|s| !s.is_empty())
+                .cloned()
+            else {
+                return None;
+            };
+            client
+                .post(format!(
+                    "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/meta/llama-3.1-8b-instruct"
+                ))
+                .bearer_auth(key)
+                .json(&serde_json::json!({
+                    "messages": [{ "role": "user", "content": "hi" }],
+                    "max_tokens": 1,
+                }))
+        }
         _ => return None,
     })
 }

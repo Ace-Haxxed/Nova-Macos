@@ -404,6 +404,7 @@ pub fn run() {
             commands::llm::openai_chat,
             commands::llm::anthropic_chat,
             commands::llm::gemini_chat,
+            commands::llm::cloudflare_chat,
             commands::llm::llm_cancel,
             commands::llm::http_request,
             commands::keys::open_keys_requested,

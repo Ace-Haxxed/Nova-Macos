@@ -261,6 +261,7 @@ fn pretty_provider(provider: &str) -> &str {
         "openrouter" => "OpenRouter",
         "nvidia" => "NVIDIA",
         "bytez" => "Bytez",
+        "cloudflare" => "Cloudflare AI",
         "builtin" => "The built-in model",
         _ => "The model provider",
     }
@@ -520,6 +521,54 @@ pub fn ollama_body(
 
 fn trim_base(url: &str) -> String {
     url.trim_end_matches('/').to_string()
+}
+
+/// Cloudflare Workers AI. Two credentials: an account id in the URL and an
+/// API token in the Authorization header. The chat-completions surface
+/// speaks the OpenAI SSE dialect verbatim, so the body shape mirrors the
+/// OpenAI one and the stream is parsed by the same code.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn cloudflare_chat(
+    app: AppHandle,
+    stream_id: String,
+    api_key: String,
+    base_url: Option<String>,
+    _model: String,
+    messages: Value,
+    tools: Option<Value>,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+) -> JResult<StreamStart> {
+    // `base_url` arrives as the full per-model URL already — `core/llm.ts`
+    // builds it by appending the encoded model to the per-account base.
+    let url = base_url
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| {
+            "https://api.cloudflare.com/client/v4/accounts/__account_id__/ai/run/__model__"
+                .to_string()
+        });
+
+    let mut body = json!({
+        "messages": messages,
+        "stream": true,
+        "max_tokens": max_tokens.unwrap_or(1024),
+    });
+    if let Some(t) = temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(tools) = tools {
+        if tools.as_array().is_some_and(|a| !a.is_empty()) {
+            body["tools"] = tools;
+            body["tool_choice"] = json!("auto");
+        }
+    }
+
+    let request = client()
+        .post(&url)
+        .bearer_auth(clean_key(&api_key))
+        .json(&body);
+    Ok(stream_request(app, "cloudflare", stream_id, request, url).await)
 }
 
 /* ── Provider commands ──────────────────────────────────────────── */

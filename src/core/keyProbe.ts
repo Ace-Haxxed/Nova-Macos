@@ -32,6 +32,7 @@ const LABEL: Record<Provider, string> = {
   openrouter: 'OpenRouter',
   nvidia: 'NVIDIA',
   bytez: 'Bytez',
+  cloudflare: 'Cloudflare AI',
 };
 
 /**
@@ -79,6 +80,61 @@ export async function fetchFreeModels(
         };
       })
       .sort((a, b) => b.context - a.context || a.id.localeCompare(b.id));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * One row of Cloudflare's model catalogue, shaped for the dropdown.
+ */
+export interface CloudflareModel {
+  id: string;
+  name: string;
+  /** True when Cloudflare charges no neurons for this model. */
+  free: boolean;
+}
+
+/**
+ * List the text-generation models Cloudflare offers on the free tier.
+ *
+ * Filtering on `task=text-generation` and a zero `per_unit_input_price`
+ * keeps the dropdown to models that work without a paid plan. Returns an
+ * empty list on any failure — a dropdown that cannot load is not a reason
+ * to fail opening settings, and the provider already has a static default
+ * model that will work.
+ */
+export async function fetchCloudflareModels(
+  accountId: string,
+  token: string,
+): Promise<CloudflareModel[]> {
+  const trimmedId = accountId.trim();
+  const trimmedToken = token.replace(/\s+/g, '');
+  if (!trimmedId || !trimmedToken) return [];
+  try {
+    const response = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(trimmedId)}/ai/models/search?task=text-generation`,
+      { headers: { Authorization: `Bearer ${trimmedToken}` } },
+    );
+    if (!response.ok) return [];
+    const body = (await response.json()) as { result?: Array<Record<string, unknown>> };
+    const items = Array.isArray(body.result) ? body.result : [];
+    const free = items
+      .filter((m) => {
+        const id = typeof m.id === 'string' ? m.id : '';
+        const name = typeof m.name === 'string' ? m.name : id;
+        const price = m.pricing as { per_unit_input_price?: unknown } | undefined;
+        // "0" and missing both mean free. Anything else is paid.
+        const free = price == null || price.per_unit_input_price === 0;
+        return Boolean(id) && free && name.toLowerCase().includes('instruct');
+      })
+      .map((m) => {
+        const id = m.id as string;
+        const name = typeof m.name === 'string' ? m.name : id;
+        return { id, name, free: true };
+      })
+      .sort((a, b) => a.id.localeCompare(b.id));
+    return free;
   } catch {
     return [];
   }
@@ -144,6 +200,82 @@ function request(provider: Provider, key: string): { url: string; init: RequestI
         url: 'https://api.bytez.com/models/v2/list/tasks',
         init: { headers: { Authorization: key } },
       };
+    case 'cloudflare':
+      // Cloudflare's account id + token pair is checked as a unit: a valid
+      // token bound to a missing account, or a valid account with no Workers
+      // AI permission, both fail the same way. The cheapest authenticating
+      // call is a one-token chat completion against the default model.
+      throw new Error('cloudflare requires an account id — use probeCloudflare');
+  }
+}
+
+/**
+ * Probe Cloudflare with both the account id and the API token.
+ *
+ * The single-key probe table above carries one credential, but Cloudflare's
+ * endpoint is keyed on the account id (which lives in the URL) and authorised
+ * by the token (which lives in the header). Without a way to send both, the
+ * generic `probeKey` cannot check it — so this is the dedicated path.
+ */
+export async function probeCloudflare(
+  accountId: string,
+  token: string,
+): Promise<KeyProbeResult> {
+  const trimmedId = accountId.trim();
+  const trimmedToken = token.replace(/\s+/g, '');
+  if (!trimmedId) return { ok: false, message: 'Account ID is required.', latencyMs: 0 };
+  if (!trimmedToken) return { ok: false, message: 'API token is required.', latencyMs: 0 };
+
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const response = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(trimmedId)}/ai/run/@cf/meta/llama-3.1-8b-instruct`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${trimmedToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 1,
+        }),
+        signal: controller.signal,
+      },
+    );
+    const latencyMs = Date.now() - started;
+
+    if (response.ok) {
+      return { ok: true, message: `Connected in ${latencyMs} ms.`, latencyMs };
+    }
+    // Cloudflare's status codes line up with the failure they actually mean:
+    // 401 is a bad token, 403 is a wrong or disabled account id (or the
+    // token does not carry Workers AI permission). Reading them off the
+    // status line lets the user fix the right field.
+    const detail =
+      response.status === 401
+        ? 'API token was refused. Check you copied the whole thing.'
+        : response.status === 403
+          ? 'Account ID was rejected, or the token lacks Workers AI permission.'
+          : response.status === 429
+            ? 'Rate limited — credentials look valid. Try again shortly.'
+            : `Cloudflare answered ${response.status}.`;
+    return { ok: false, latencyMs, message: detail };
+  } catch (e) {
+    const latencyMs = Date.now() - started;
+    const aborted = e instanceof DOMException && e.name === 'AbortError';
+    return {
+      ok: false,
+      latencyMs,
+      message: aborted
+        ? 'Cloudflare did not answer in time.'
+        : 'Could not reach Cloudflare. Check your internet connection.',
+    };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -157,6 +289,18 @@ function request(provider: Provider, key: string): { url: string; init: RequestI
 export async function probeKey(provider: Provider, key: string): Promise<KeyProbeResult> {
   const trimmed = key.replace(/\s+/g, '');
   if (!trimmed) return { ok: false, message: 'No key entered.', latencyMs: 0 };
+
+  // Cloudflare is the one provider that needs a second credential (account
+  // id) the generic probe does not have. The caller knows to use
+  // `probeCloudflare` instead; this branch is unreachable in practice but
+  // guards against a stray invocation.
+  if (provider === 'cloudflare') {
+    return {
+      ok: false,
+      message: 'Cloudflare also needs an Account ID — use Test Connection in Settings.',
+      latencyMs: 0,
+    };
+  }
 
   const started = Date.now();
   const controller = new AbortController();

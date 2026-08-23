@@ -16,10 +16,12 @@ export type Provider =
   | 'groq'
   | 'openrouter'
   | 'nvidia'
-  | 'bytez';
+  | 'bytez'
+  | 'cloudflare';
 
 export const PROVIDERS: Provider[] = [
   'bytez',
+  'cloudflare',
   'openrouter',
   'nvidia',
   'groq',
@@ -36,6 +38,7 @@ export const PROVIDER_LABEL: Record<Provider, string> = {
   openrouter: 'OpenRouter',
   nvidia: 'NVIDIA',
   bytez: 'Bytez',
+  cloudflare: 'Cloudflare AI',
 };
 
 /** Where to get a key, shown next to an empty field. */
@@ -47,6 +50,7 @@ export const PROVIDER_CONSOLE: Record<Provider, string> = {
   openrouter: 'openrouter.ai/keys',
   nvidia: 'build.nvidia.com',
   bytez: 'bytez.com',
+  cloudflare: 'dash.cloudflare.com → API Tokens',
 };
 
 export interface KeyCheck {
@@ -236,6 +240,11 @@ const DEFAULT_MODEL_FOR: Record<Provider, string> = {
   gemini: 'gemini-2.5-flash',
   nvidia: 'meta/llama-3.3-70b-instruct',
   bytez: 'google/gemma-2-9b-it',
+  // Cloudflare's free tier — 10,000 neurons/day, well above what the 8B
+  // model consumes. Resolving from the live catalogue would be nicer but
+  // Cloudflare does not require a key to list models, so the dropdown is
+  // populated by the settings page rather than by `load()`.
+  cloudflare: '@cf/meta/llama-3.1-8b-instruct',
   // Resolved from the live catalogue, never hardcoded.
   openrouter: '',
 };

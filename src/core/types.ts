@@ -158,6 +158,7 @@ export type LLMProvider =
   | 'openai'
   | 'anthropic'
   | 'gemini'
+  | 'cloudflare'
   | 'custom'
   | 'on-device';
 
@@ -168,6 +169,15 @@ export interface LLMConfig {
   /** Only used by `custom`; the other providers have fixed base URLs. */
   baseUrl?: string;
   apiKey?: string;
+  /**
+   * Per-provider extras. Cloudflare is the only consumer today — its endpoint
+   * is keyed on the account id, not the auth token — but the shape is generic
+   * so the next provider that needs a second field does not require another
+   * config change.
+   */
+  apiKeyExtra?: {
+    cloudflareAccountId?: string;
+  };
   temperature: number;
   maxTokens: number;
   systemPrompt: string;
